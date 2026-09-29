@@ -107,7 +107,21 @@ DeviceKit runs as an XCUITest. Once installed and launched on a device or simula
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DEVICEKIT_LISTEN_PORT` | `12004` | JSON-RPC server port |
-| `DEVICEKIT_LISTEN_HOST` | `127.0.0.1` | Bind address for the JSON-RPC server. All TCP servers (video, audio) also bind to `127.0.0.1` by default. |
+| `DEVICEKIT_LISTEN_HOST` | `127.0.0.1` | Bind address for the JSON-RPC server: a comma-separated list of IPv4 or IPv6 literals, one listener each. All TCP servers (video, audio) also bind to `127.0.0.1` by default. |
+
+#### Reaching a real device over Wi-Fi
+
+Xcode keeps a private IPv6 tunnel to each paired device, reachable only from the paired Mac and kept when the device switches from USB to Wi-Fi. Add the device side of that tunnel to the listen list to reach DeviceKit without USB port forwarding, while keeping the loopback listener for existing clients. `xcodebuild` passes `TEST_RUNNER_`-prefixed variables into the test runner:
+
+```bash
+TUNNEL=$(xcrun devicectl device info details --device <udid> | awk '/Tunnel IP Address/{print $NF}')
+TEST_RUNNER_DEVICEKIT_LISTEN_HOST="127.0.0.1,$TUNNEL" xcodebuild test-without-building \
+  -project devicekit-ios.xcodeproj -scheme devicekit-ios -destination "id=<udid>"
+curl -g -X POST "http://[$TUNNEL]:12004/rpc" -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"device.info","params":{},"id":1}'
+```
+
+Avoid binding `0.0.0.0` or the device's Wi-Fi address instead: the server has no authentication, so that exposes device control to the whole network.
 
 **Endpoints:**
 

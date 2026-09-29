@@ -75,8 +75,15 @@ final class XCTestServer {
     /// Default port for the WebSocket server.
     private let defaultPort: UInt16 = 12004
 
-    /// Server binds to localhost only by default. Override with LISTEN_HOST env var.
-    private let localhost = ProcessInfo.processInfo.environment["DEVICEKIT_LISTEN_HOST"] ?? "127.0.0.1"
+    /// Server binds to localhost only by default. Override with DEVICEKIT_LISTEN_HOST: a comma-separated
+    /// list of IPv4/IPv6 literals, one listener each (e.g. `127.0.0.1,fdc0::1` keeps loopback alongside IPv6).
+    private let listenHosts: [String] = {
+        let hosts = (ProcessInfo.processInfo.environment["DEVICEKIT_LISTEN_HOST"] ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        return hosts.isEmpty ? ["127.0.0.1"] : hosts
+    }()
 
     private let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier!,
@@ -99,13 +106,33 @@ final class XCTestServer {
     /// - Throws: An error if the server fails to bind or encounters a runtime error.
     func start() async throws {
         let port = ProcessInfo.processInfo.environment["DEVICEKIT_LISTEN_PORT"]?.toUInt16() ?? defaultPort
-        let server = HTTPServer(
-            address: try .inet(ip4: localhost, port: port),
-            timeout: defaultTimeout
-        )
+        let servers = try listenHosts.map { try makeServer(host: $0, port: port) }
 
-        logger.info("Starting JSON-RPC server on \(self.localhost):\(port)")
+        for (host, server) in zip(listenHosts, servers) {
+            await configureRoutes(on: server, stopping: servers)
+            let displayHost = host.contains(":") ? "[\(host)]" : host
+            let base = "\(displayHost):\(port)"
+            logger.info("Server is ready (WebSocket: ws://\(base)/ws, HTTP: POST http://\(base)/rpc, MJPEG: http://\(base)/mjpeg)")
+        }
 
+        // Returns once every listener has stopped; if one fails, the rest are cancelled and the error propagates.
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for server in servers {
+                group.addTask { try await server.run() }
+            }
+            try await group.waitForAll()
+        }
+    }
+
+    /// .inet(ip4:) rejects IPv6 literals such as the Xcode CoreDevice tunnel address, so pick by address family.
+    private func makeServer(host: String, port: UInt16) throws -> HTTPServer {
+        if host.contains(":") {
+            return HTTPServer(address: try .inet6(ip6: host, port: port), timeout: defaultTimeout)
+        }
+        return HTTPServer(address: try .inet(ip4: host, port: port), timeout: defaultTimeout)
+    }
+
+    private func configureRoutes(on server: HTTPServer, stopping servers: [HTTPServer]) async {
         // WebSocket endpoint for JSON-RPC
         let messageHandler = JSONRPCMessageHandler(dispatcher: dispatcher)
         let frameHandler = MessageFrameWSHandler(handler: messageHandler)
@@ -121,18 +148,15 @@ final class XCTestServer {
             HTTPResponse(statusCode: .ok, body: Data("OK".utf8))
         }
 
-        // Shutdown endpoint — stops the server gracefully
+        // Shutdown endpoint — stops every listener gracefully
         await server.appendRoute("POST /shutdown") { _ in
-            Task { await server.stop() }
+            Task { for server in servers { await server.stop() } }
             return HTTPResponse(statusCode: .ok, body: Data("OK".utf8))
         }
 
         // MJPEG streaming endpoint
         let mjpegHandler = MJPEGHTTPHandler()
         await server.appendRoute("GET /mjpeg", to: mjpegHandler)
-
-        logger.info("Server is ready (WebSocket: ws://\(self.localhost):\(port)/ws, HTTP: POST http://\(self.localhost):\(port)/rpc, MJPEG: http://\(self.localhost):\(port)/mjpeg)")
-        try await server.run()
     }
 }
 
