@@ -82,7 +82,10 @@ final class XCTestServer {
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
-        return hosts.isEmpty ? ["127.0.0.1"] : hosts
+        // Drop exact duplicates: a second bind on the same address would fail startup.
+        var seen = Set<String>()
+        let unique = hosts.filter { seen.insert($0).inserted }
+        return unique.isEmpty ? ["127.0.0.1"] : unique
     }()
 
     private let logger = Logger(
@@ -120,11 +123,16 @@ final class XCTestServer {
             for server in servers {
                 group.addTask { try await server.run() }
             }
-            try await group.waitForAll()
+            do {
+                while try await group.next() != nil {}
+            } catch {
+                group.cancelAll()
+                throw error
+            }
         }
     }
 
-    /// .inet(ip4:) rejects IPv6 literals such as the Xcode CoreDevice tunnel address, so pick by address family.
+    /// Builds an HTTPServer for one IPv4/IPv6 literal. `.inet(ip4:)` rejects IPv6 literals such as the Xcode CoreDevice tunnel address, so pick by address family.
     private func makeServer(host: String, port: UInt16) throws -> HTTPServer {
         if host.contains(":") {
             return HTTPServer(address: try .inet6(ip6: host, port: port), timeout: defaultTimeout)
@@ -132,6 +140,7 @@ final class XCTestServer {
         return HTTPServer(address: try .inet(ip4: host, port: port), timeout: defaultTimeout)
     }
 
+    /// Registers all routes on `server`; `/shutdown` stops every server in `servers`.
     private func configureRoutes(on server: HTTPServer, stopping servers: [HTTPServer]) async {
         // WebSocket endpoint for JSON-RPC
         let messageHandler = JSONRPCMessageHandler(dispatcher: dispatcher)
